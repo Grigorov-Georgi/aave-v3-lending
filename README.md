@@ -1,66 +1,56 @@
-## Foundry
+# Aave V3 Unified Vault
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+A pooled vault-style adapter that integrates with **Aave V3** as a single on-chain account on behalf of many users. Users receive internal **supply shares** and **debt shares** that automatically reflect interest accrual via Aave's aTokens and variable debt tokens.
 
-Foundry consists of:
+> ⚠️ This is a reference implementation for learning/testing. It makes the **entire vault's collateral** available to secure any user's borrow (pooled risk). Review and harden before production.
 
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+---
 
-## Documentation
+## File tree
 
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+```
+.
+├── foundry.toml
+├── README.md
+├── src
+│   ├── AaveV3UnifiedVault.sol
+│   └── interfaces
+│       ├── IAaveV3Pool.sol
+│       ├── IAaveV3DataProvider.sol
+│       └── IERC20.sol
+├── test
+│   ├── AaveV3UnifiedVault.t.sol
+│   ├── mocks
+│   │   ├── MockERC20.sol
+│   │   ├── MockAToken.sol
+│   │   ├── MockDebtToken.sol
+│   │   ├── MockAavePool.sol
+│   │   └── MockDataProvider.sol
+│   └── TestHelpers.sol
+└── script
+    └── Deploy.s.sol
 ```
 
-### Test
+---
 
-```shell
-$ forge test
+## Quickstart
+
+```bash
+# 1) Install Foundry if needed: https://book.getfoundry.sh/getting-started/installation
+# 2) Init project
+forge install
+forge build
+forge test -vv
 ```
 
-### Format
+## Live network testing (fork)
 
-```shell
-$ forge fmt
-```
+Replace the mocks with a mainnet fork test if you prefer to hit real Aave V3. Update `foundry.toml` with your `rpc_url` and write a fork test pointing to the network's `POOL` and `DATA_PROVIDER` addresses.
 
-### Gas Snapshots
+## Design notes
 
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+* **Single Aave account:** The vault calls Aave with `onBehalfOf = address(this)`, pooling collateral and debt.
+* **Interest reflection:** Users hold **supply shares** and **debt shares**. Conversion uses current `aToken.balanceOf(this)` and `vDebt.balanceOf(this)`, so interest automatically flows into balances.
+* **Variable rate only:** For brevity we use variable debt (mode = 2). Stable rate could be added similarly.
+* **Safety:** Anyone can borrow; the whole pool's collateral backs it. That's appropriate for a pooled lending account but risky in production. Add ACLs, per-user LTV checks, or isolate positions if needed.
+* **Rounding:** Withdraw uses round-up share conversion; deposit/borrow use round-down; repay burns proportionally by pre-repay totals.
