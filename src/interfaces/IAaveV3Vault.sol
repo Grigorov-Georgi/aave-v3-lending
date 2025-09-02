@@ -35,6 +35,7 @@ interface IAaveV3Vault {
         uint256 shares
     );
 
+    error ZeroAddress();
     error ZeroAmount();
     error InsufficientShares();
     error InvalidAsset();

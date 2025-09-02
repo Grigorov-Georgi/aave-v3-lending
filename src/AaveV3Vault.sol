@@ -1,13 +1,36 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {IPool} from "../lib/aave-v3-core/contracts/interfaces/IPool.sol";
+import {IAToken} from "../lib/aave-v3-core/contracts/interfaces/IAToken.sol";
 import {DataTypes} from "../lib/aave-v3-core/contracts/protocol/libraries/types/DataTypes.sol";
 import {IAaveV3Vault} from "./interfaces/IAaveV3Vault.sol";
+import {WadRayMath} from "../lib/aave-v3-core/contracts/protocol/libraries/math/WadRayMath.sol";
+import {PercentageMath} from "../lib/aave-v3-core/contracts/protocol/libraries/math/PercentageMath.sol";
 
-contract AaveV3Vault is IAaveV3Vault {
+contract AaveV3Vault is IAaveV3Vault, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    //TODO: Add a method to withdraw aTokens because they are tradable
+
     uint256 private constant VARIABLE_RATE_MODE = 2;
+
+    /// @notice Aave variable rate mode from DataTypes
+    uint256 private constant VARIABLE_INTEREST_RATE =
+        uint256(DataTypes.InterestRateMode.VARIABLE);
+    /// @notice Minimum health factor threshold (1.00 in WAD)
+    uint256 private constant MIN_HEALTH_FACTOR = WadRayMath.WAD; // 1.00 in WAD; can set > WadRayMath.WAD for safety buffer
+    /// @notice Borrow buffer percentage (95% of available borrows)
+    uint256 private constant BORROW_BUFFER_BPS = 9_500; // 95% of available borrows
+    /// @notice Basis points denominator from Aave PercentageMath
+    uint256 private constant BPS_DENOM = PercentageMath.PERCENTAGE_FACTOR;
+    /// @notice WAD constant from Aave WadRayMath
+    uint256 private constant WAD = WadRayMath.WAD;
+    /// @notice RAY constant from Aave WadRayMath
+    uint256 private constant RAY = WadRayMath.RAY;
 
     struct AssetData {
         uint256 totalSupplyShares; // sum of all users' supply shares for this asset
@@ -26,170 +49,143 @@ contract AaveV3Vault is IAaveV3Vault {
     mapping(address => mapping(address => uint256)) public debtSharesOf; // variable debt only
 
     constructor(address pool) {
+        if (pool == address(0)) revert ZeroAddress();
         POOL = IPool(pool);
     }
 
     function deposit(
         address asset,
         uint256 amount
-    ) external override returns (uint256 shares) {
+    ) external override returns (uint256) {
         if (amount == 0) revert ZeroAmount();
         _ensureInitialized(asset);
 
-        // Pull tokens
-        _safeTransferFrom(asset, msg.sender, address(this), amount);
-        _safeApprove(asset, address(POOL), amount);
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+        _safeApproveWithReset(asset, address(POOL), amount);
 
-        // Compute shares before mutating totals
-        uint256 totalAssets = totalSupplyAssets(asset);
+        uint256 totalBefore = _totalSupplyAssets(asset);
         AssetData storage a = assets[asset];
-        shares = (a.totalSupplyShares == 0 || totalAssets == 0)
-            ? amount
-            : (amount * a.totalSupplyShares) / totalAssets;
 
         // Interact with Aave
         POOL.supply(asset, amount, address(this), 0);
 
-        // Mint internal shares
-        a.totalSupplyShares += shares;
-        supplySharesOf[msg.sender][asset] += shares;
+        uint256 sharesEarned = IAToken(a.aToken).scaledBalanceOf(
+            address(this)
+        ) - totalBefore;
 
-        emit Deposit(msg.sender, asset, amount, shares);
+        a.totalSupplyShares += sharesEarned;
+        supplySharesOf[msg.sender][asset] += sharesEarned;
+
+        emit Deposit(msg.sender, asset, amount, sharesEarned);
+
+        return sharesEarned;
     }
 
-    function withdraw(
-        address asset,
-        uint256 amount
-    ) external override returns (uint256 shares) {
-        if (amount == 0) revert ZeroAmount();
-        _ensureInitialized(asset);
+    // TODO: fix these
 
-        AssetData storage a = assets[asset];
-        uint256 totalAssets = totalSupplyAssets(asset);
-        // shares = ceil(assets * totalShares / totalAssets)
-        shares = _mulDivUp(amount, a.totalSupplyShares, totalAssets);
-        uint256 userShares = supplySharesOf[msg.sender][asset];
-        if (shares > userShares) revert InsufficientShares();
+    // function withdraw(
+    //     address asset,
+    //     uint256 amount
+    // ) external override returns (uint256) {
+    //     if (amount == 0) revert ZeroAmount();
+    //     _ensureInitialized(asset);
 
-        // Burn shares first (effects)
-        supplySharesOf[msg.sender][asset] = userShares - shares;
-        a.totalSupplyShares -= shares;
+    //     AssetData storage a = assets[asset];
+    //     uint256 totalAssets = _totalSupplyAssets(asset);
+    //     // shares = ceil(assets * totalShares / totalAssets)
+    //     shares = _mulDivUp(amount, a.totalSupplyShares, totalAssets);
+    //     uint256 userShares = supplySharesOf[msg.sender][asset];
+    //     if (shares > userShares) revert InsufficientShares();
 
-        // Withdraw from Aave directly to user (interactions)
-        uint256 withdrawn = POOL.withdraw(asset, amount, msg.sender);
-        // Aave might withdraw slightly less if dust rounding; re-sync by recomputing shares with actual amount if needed
-        if (withdrawn != amount) {
-            // Adjust back if withdrawn less: re-mint the delta shares to user to avoid silent loss
-            uint256 adjShares = _mulDivUp(
-                amount - withdrawn,
-                a.totalSupplyShares + shares,
-                totalAssets
-            ); // use prev totals
-            supplySharesOf[msg.sender][asset] += adjShares;
-            a.totalSupplyShares += adjShares;
-            shares -= adjShares;
-            amount = withdrawn;
-        }
+    //     // Burn shares first (effects)
+    //     supplySharesOf[msg.sender][asset] = userShares - shares;
+    //     a.totalSupplyShares -= shares;
 
-        emit Withdraw(msg.sender, asset, amount, shares);
-    }
+    //     // Withdraw from Aave directly to user (interactions)
+    //     uint256 withdrawn = POOL.withdraw(asset, amount, msg.sender);
+    //     // Aave might withdraw slightly less if dust rounding; re-sync by recomputing shares with actual amount if needed
+    //     if (withdrawn != amount) {
+    //         // Adjust back if withdrawn less: re-mint the delta shares to user to avoid silent loss
+    //         uint256 adjShares = _mulDivUp(
+    //             amount - withdrawn,
+    //             a.totalSupplyShares + shares,
+    //             totalAssets
+    //         ); // use prev totals
+    //         supplySharesOf[msg.sender][asset] += adjShares;
+    //         a.totalSupplyShares += adjShares;
+    //         shares -= adjShares;
+    //         amount = withdrawn;
+    //     }
 
-    function borrow(
-        address asset,
-        uint256 amount
-    ) external override returns (uint256 shares) {
-        if (amount == 0) revert ZeroAmount();
-        _ensureInitialized(asset);
-        AssetData storage a = assets[asset];
+    //     emit Withdraw(msg.sender, asset, amount, shares);
+    // }
 
-        uint256 totalDebtBefore = totalDebtAssets(asset);
-        shares = (a.totalDebtShares == 0 || totalDebtBefore == 0)
-            ? amount
-            : (amount * a.totalDebtShares) / totalDebtBefore;
+    // function borrow(
+    //     address asset,
+    //     uint256 amount
+    // ) external override returns (uint256 shares) {
+    //     if (amount == 0) revert ZeroAmount();
+    //     _ensureInitialized(asset);
+    //     AssetData storage a = assets[asset];
 
-        // Interact with Aave (borrow transfers funds to this contract)
-        POOL.borrow(asset, amount, VARIABLE_RATE_MODE, 0, address(this));
+    //     uint256 totalDebtBefore = totalDebtAssets(asset);
+    //     shares = (a.totalDebtShares == 0 || totalDebtBefore == 0)
+    //         ? amount
+    //         : (amount * a.totalDebtShares) / totalDebtBefore;
 
-        // Bookkeeping
-        a.totalDebtShares += shares;
-        debtSharesOf[msg.sender][asset] += shares;
+    //     // Interact with Aave (borrow transfers funds to this contract)
+    //     POOL.borrow(asset, amount, VARIABLE_RATE_MODE, 0, address(this));
 
-        // Send borrowed funds to user
-        _safeTransfer(asset, msg.sender, amount);
+    //     // Bookkeeping
+    //     a.totalDebtShares += shares;
+    //     debtSharesOf[msg.sender][asset] += shares;
 
-        emit Borrow(msg.sender, asset, amount, shares);
-    }
+    //     // Send borrowed funds to user
+    //     IERC20(asset).safeTransfer(msg.sender, amount);
 
-    function repay(
-        address asset,
-        uint256 amount
-    ) external override returns (uint256 repaid, uint256 sharesBurned) {
-        if (amount == 0) revert ZeroAmount();
-        _ensureInitialized(asset);
-        AssetData storage a = assets[asset];
+    //     emit Borrow(msg.sender, asset, amount, shares);
+    // }
 
-        // Clamp to user's current debt to prevent overpaying others' debt.
-        uint256 userDebt = debtAssetsOf(msg.sender, asset);
-        if (amount > userDebt) amount = userDebt;
+    // function repay(
+    //     address asset,
+    //     uint256 amount
+    // ) external override returns (uint256 repaid, uint256 sharesBurned) {
+    //     if (amount == 0) revert ZeroAmount();
+    //     _ensureInitialized(asset);
+    //     AssetData storage a = assets[asset];
 
-        // Pull funds and approve
-        _safeTransferFrom(asset, msg.sender, address(this), amount);
-        _safeApprove(asset, address(POOL), amount);
+    //     // Clamp to user's current debt to prevent overpaying others' debt.
+    //     uint256 userDebt = debtAssetsOf(msg.sender, asset);
+    //     if (amount > userDebt) amount = userDebt;
 
-        uint256 totalDebtBefore = totalDebtAssets(asset);
-        repaid = POOL.repay(asset, amount, VARIABLE_RATE_MODE, address(this));
+    //     // Pull funds and approve
+    //     IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+    //     _safeApproveWithReset(asset, address(POOL), amount);
 
-        // Burn proportional shares based on pre-repay totals
-        if (repaid > 0) {
-            sharesBurned = (a.totalDebtShares == 0 || totalDebtBefore == 0)
-                ? 0
-                : (repaid * a.totalDebtShares) / totalDebtBefore;
+    //     uint256 totalDebtBefore = totalDebtAssets(asset);
+    //     repaid = POOL.repay(asset, amount, VARIABLE_RATE_MODE, address(this));
 
-            uint256 userShares = debtSharesOf[msg.sender][asset];
-            if (sharesBurned > userShares) {
-                sharesBurned = userShares; // safety for rounding
-            }
-            debtSharesOf[msg.sender][asset] = userShares - sharesBurned;
-            a.totalDebtShares -= sharesBurned;
-        }
+    //     // Burn proportional shares based on pre-repay totals
+    //     if (repaid > 0) {
+    //         sharesBurned = (a.totalDebtShares == 0 || totalDebtBefore == 0)
+    //             ? 0
+    //             : (repaid * a.totalDebtShares) / totalDebtBefore;
 
-        emit Repay(msg.sender, asset, repaid, sharesBurned);
-    }
+    //         uint256 userShares = debtSharesOf[msg.sender][asset];
+    //         if (sharesBurned > userShares) {
+    //             sharesBurned = userShares; // safety for rounding
+    //         }
+    //         debtSharesOf[msg.sender][asset] = userShares - sharesBurned;
+    //         a.totalDebtShares -= sharesBurned;
+    //     }
 
-    function totalSupplyAssets(
-        address asset
-    ) public view override returns (uint256) {
-        AssetData storage a = assets[asset];
-        if (!a.initialized) return 0;
-        return IERC20(a.aToken).balanceOf(address(this));
-    }
+    //     emit Repay(msg.sender, asset, repaid, sharesBurned);
+    // }
 
-    function totalDebtAssets(
-        address asset
-    ) public view override returns (uint256) {
-        AssetData storage a = assets[asset];
-        if (!a.initialized) return 0;
-        return IERC20(a.variableDebtToken).balanceOf(address(this));
-    }
-
-    function supplyAssetsOf(
-        address user,
-        address asset
-    ) external view override returns (uint256) {
-        AssetData storage a = assets[asset];
-        uint256 tAssets = totalSupplyAssets(asset);
-        if (a.totalSupplyShares == 0 || tAssets == 0) return 0;
-        return (supplySharesOf[user][asset] * tAssets) / a.totalSupplyShares;
-    }
-
-    function debtAssetsOf(
-        address user,
-        address asset
-    ) public view override returns (uint256) {
-        AssetData storage a = assets[asset];
-        uint256 tDebt = totalDebtAssets(asset);
-        if (a.totalDebtShares == 0 || tDebt == 0) return 0;
-        return (debtSharesOf[user][asset] * tDebt) / a.totalDebtShares;
+    function _totalSupplyAssets(address asset) private view returns (uint256) {
+        AssetData storage assetData = assets[asset];
+        if (!assetData.initialized) return 0;
+        return IAToken(assetData.aToken).scaledBalanceOf(address(this));
     }
 
     function _ensureInitialized(address asset) internal {
@@ -208,67 +204,52 @@ contract AaveV3Vault is IAaveV3Vault {
         a.initialized = true;
     }
 
-    function _mulDivUp(
-        uint256 x,
-        uint256 y,
-        uint256 d
-    ) internal pure returns (uint256) {
-        return (x * y + d - 1) / d; // safe for our inputs; 0-division guarded by callers
+    // TODO: this can be public if the caller is the user
+    function _getUserSupplyBalance(
+        address user,
+        address asset
+    ) private view returns (uint256) {
+        uint256 userShares = supplySharesOf[user][asset];
+        if (userShares == 0) return 0;
+        uint256 li = POOL.getReserveNormalizedIncome(asset);
+        return (userShares * li) / RAY;
     }
 
-    function _safeTransferFrom(
-        address token,
-        address from,
-        address to,
-        uint256 amount
-    ) internal {
+    // TODO: this can be public if the caller is the user
+    function _getUserBorrowBalance(
+        address user,
+        address asset
+    ) private view returns (uint256) {
+        uint256 userShares = debtSharesOf[user][asset];
+        if (userShares == 0) return 0;
+        uint256 di = POOL.getReserveNormalizedVariableDebt(asset);
+        return (userShares * di) / RAY;
+    }
+
+    function _safeApprove(address token, address to, uint256 value) internal {
         (bool success, bytes memory data) = token.call(
-            abi.encodeWithSelector(
-                IERC20.transferFrom.selector,
-                from,
-                to,
-                amount
-            )
+            abi.encodeWithSelector(IERC20.approve.selector, to, value)
         );
         require(
             success && (data.length == 0 || abi.decode(data, (bool))),
-            "Transfer failed"
+            "SA"
         );
     }
 
-    function _safeTransfer(address token, address to, uint256 amount) internal {
-        (bool success, bytes memory data) = token.call(
-            abi.encodeWithSelector(IERC20.transfer.selector, to, amount)
-        );
-        require(
-            success && (data.length == 0 || abi.decode(data, (bool))),
-            "Transfer failed"
-        );
-    }
-
-    function _safeApprove(
+    function _safeApproveWithReset(
         address token,
         address spender,
         uint256 amount
     ) internal {
-        // Reset approval to 0 first to prevent approval race condition attacks
-        // Some tokens (like USDT) require allowance to be 0 before setting a new value
-        (bool success, bytes memory data) = token.call(
-            abi.encodeWithSelector(IERC20.approve.selector, spender, 0)
+        uint256 currentAllowance = IERC20(token).allowance(
+            address(this),
+            spender
         );
-        require(
-            success && (data.length == 0 || abi.decode(data, (bool))),
-            "Approve reset failed"
-        );
-
-        if (amount > 0) {
-            (success, data) = token.call(
-                abi.encodeWithSelector(IERC20.approve.selector, spender, amount)
-            );
-            require(
-                success && (data.length == 0 || abi.decode(data, (bool))),
-                "Approve failed"
-            );
+        if (currentAllowance != amount) {
+            if (currentAllowance != 0) {
+                _safeApprove(token, spender, 0);
+            }
+            _safeApprove(token, spender, amount);
         }
     }
 }
