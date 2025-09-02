@@ -3,37 +3,11 @@ pragma solidity ^0.8.30;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPool} from "../lib/aave-v3-core/contracts/interfaces/IPool.sol";
-import {IPoolDataProvider} from "../lib/aave-v3-core/contracts/interfaces/IPoolDataProvider.sol";
+import {DataTypes} from "../lib/aave-v3-core/contracts/protocol/libraries/types/DataTypes.sol";
+import {IAaveV3Vault} from "./interfaces/IAaveV3Vault.sol";
 
-contract AaveV3Vault {
-    error ZeroAmount();
-    error InsufficientShares();
-    error InvalidAsset();
-
-    event Deposit(
-        address indexed user,
-        address indexed asset,
-        uint256 assets,
-        uint256 shares
-    );
-    event Withdraw(
-        address indexed user,
-        address indexed asset,
-        uint256 assets,
-        uint256 shares
-    );
-    event Borrow(
-        address indexed user,
-        address indexed asset,
-        uint256 assets,
-        uint256 shares
-    );
-    event Repay(
-        address indexed user,
-        address indexed asset,
-        uint256 assets,
-        uint256 shares
-    );
+contract AaveV3Vault is IAaveV3Vault {
+    uint256 private constant VARIABLE_RATE_MODE = 2;
 
     struct AssetData {
         uint256 totalSupplyShares; // sum of all users' supply shares for this asset
@@ -44,7 +18,6 @@ contract AaveV3Vault {
     }
 
     IPool public immutable POOL;
-    IPoolDataProvider public immutable DATA_PROVIDER;
 
     mapping(address => AssetData) public assets; // asset => data
 
@@ -52,15 +25,14 @@ contract AaveV3Vault {
     mapping(address => mapping(address => uint256)) public supplySharesOf;
     mapping(address => mapping(address => uint256)) public debtSharesOf; // variable debt only
 
-    constructor(address pool, address dataProvider) {
+    constructor(address pool) {
         POOL = IPool(pool);
-        DATA_PROVIDER = IPoolDataProvider(dataProvider);
     }
 
     function deposit(
         address asset,
         uint256 amount
-    ) external returns (uint256 shares) {
+    ) external override returns (uint256 shares) {
         if (amount == 0) revert ZeroAmount();
         _ensureInitialized(asset);
 
@@ -88,7 +60,7 @@ contract AaveV3Vault {
     function withdraw(
         address asset,
         uint256 amount
-    ) external returns (uint256 shares) {
+    ) external override returns (uint256 shares) {
         if (amount == 0) revert ZeroAmount();
         _ensureInitialized(asset);
 
@@ -125,7 +97,7 @@ contract AaveV3Vault {
     function borrow(
         address asset,
         uint256 amount
-    ) external returns (uint256 shares) {
+    ) external override returns (uint256 shares) {
         if (amount == 0) revert ZeroAmount();
         _ensureInitialized(asset);
         AssetData storage a = assets[asset];
@@ -136,7 +108,7 @@ contract AaveV3Vault {
             : (amount * a.totalDebtShares) / totalDebtBefore;
 
         // Interact with Aave (borrow transfers funds to this contract)
-        POOL.borrow(asset, amount, 2, 0, address(this));
+        POOL.borrow(asset, amount, VARIABLE_RATE_MODE, 0, address(this));
 
         // Bookkeeping
         a.totalDebtShares += shares;
@@ -151,7 +123,7 @@ contract AaveV3Vault {
     function repay(
         address asset,
         uint256 amount
-    ) external returns (uint256 repaid, uint256 sharesBurned) {
+    ) external override returns (uint256 repaid, uint256 sharesBurned) {
         if (amount == 0) revert ZeroAmount();
         _ensureInitialized(asset);
         AssetData storage a = assets[asset];
@@ -165,7 +137,7 @@ contract AaveV3Vault {
         _safeApprove(asset, address(POOL), amount);
 
         uint256 totalDebtBefore = totalDebtAssets(asset);
-        repaid = POOL.repay(asset, amount, 2, address(this));
+        repaid = POOL.repay(asset, amount, VARIABLE_RATE_MODE, address(this));
 
         // Burn proportional shares based on pre-repay totals
         if (repaid > 0) {
@@ -184,13 +156,17 @@ contract AaveV3Vault {
         emit Repay(msg.sender, asset, repaid, sharesBurned);
     }
 
-    function totalSupplyAssets(address asset) public view returns (uint256) {
+    function totalSupplyAssets(
+        address asset
+    ) public view override returns (uint256) {
         AssetData storage a = assets[asset];
         if (!a.initialized) return 0;
         return IERC20(a.aToken).balanceOf(address(this));
     }
 
-    function totalDebtAssets(address asset) public view returns (uint256) {
+    function totalDebtAssets(
+        address asset
+    ) public view override returns (uint256) {
         AssetData storage a = assets[asset];
         if (!a.initialized) return 0;
         return IERC20(a.variableDebtToken).balanceOf(address(this));
@@ -199,7 +175,7 @@ contract AaveV3Vault {
     function supplyAssetsOf(
         address user,
         address asset
-    ) external view returns (uint256) {
+    ) external view override returns (uint256) {
         AssetData storage a = assets[asset];
         uint256 tAssets = totalSupplyAssets(asset);
         if (a.totalSupplyShares == 0 || tAssets == 0) return 0;
@@ -209,7 +185,7 @@ contract AaveV3Vault {
     function debtAssetsOf(
         address user,
         address asset
-    ) public view returns (uint256) {
+    ) public view override returns (uint256) {
         AssetData storage a = assets[asset];
         uint256 tDebt = totalDebtAssets(asset);
         if (a.totalDebtShares == 0 || tDebt == 0) return 0;
@@ -219,13 +195,16 @@ contract AaveV3Vault {
     function _ensureInitialized(address asset) internal {
         AssetData storage a = assets[asset];
         if (a.initialized) return;
-        (address aToken, , address variableDebtToken) = DATA_PROVIDER
-            .getReserveTokensAddresses(asset);
-        if (aToken == address(0) || variableDebtToken == address(0)) {
+
+        DataTypes.ReserveData memory reserveData = POOL.getReserveData(asset);
+        if (
+            reserveData.aTokenAddress == address(0) ||
+            reserveData.variableDebtTokenAddress == address(0)
+        ) {
             revert InvalidAsset();
         }
-        a.aToken = aToken;
-        a.variableDebtToken = variableDebtToken;
+        a.aToken = reserveData.aTokenAddress;
+        a.variableDebtToken = reserveData.variableDebtTokenAddress;
         a.initialized = true;
     }
 
